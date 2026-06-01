@@ -16,6 +16,16 @@ class DashboardService {
     required DateTime since,
     required DateTime until,
   }) async {
+    if (unitId == null || unitId.isEmpty) {
+      return DashboardOperationalSummary(
+        itemsReceivedMonthQuantity: 0,
+        itemsReceivedMonthValue: 0,
+        lastStockCountDate: null,
+        lastDelivery: null,
+        usedUnitFallback: false,
+      );
+    }
+
     try {
       debugPrint(
         'DashboardService: loadOperationalDashboardForUnit(uid=$uid, unitId=$unitId, since=$since, until=$until)',
@@ -56,46 +66,38 @@ class DashboardService {
         }
       }
 
-      // Itens (agregação) - collectionGroup e filtro por período.
-      // Suspeita de índice composto: `uid` (==) + `date` (range) + orderBy('date').
-      // Se o Firestore pedir índice, o índice composto normalmente usa os campos:
-      // - uid (asc)
-      // - date (asc)
-      debugPrint(
-        'DashboardService: QUERY receipt_items aggregation (collectionGroup="receipt_items") '
-        'filters: uid==, date in [since, until], orderBy: date',
-      );
-      late final QuerySnapshot<Map<String, dynamic>> itemsSnap;
-      try {
-        debugPrint(
-          'DashboardService: QUERY receipt_items aggregation (collectionGroup="receipt_items") '
-          'filters: uid==, date in [since, until], orderBy: date',
-        );
-        itemsSnap = await _firestore
-            .collectionGroup('receipt_items')
-            .where('uid', isEqualTo: uid)
-            .where('date', isGreaterThanOrEqualTo: Timestamp.fromDate(since))
-            .where('date', isLessThanOrEqualTo: Timestamp.fromDate(until))
-            .orderBy('date')
-            .get();
-      } catch (e, st) {
-        debugPrint('DashboardService: receipt_items aggregation query failed: $e');
-        debugPrintStack(stackTrace: st);
-        rethrow;
-      }
+      // Itens do mês: subcoleções em users/{uid}/receipts/{id}/receipt_items
+      // (evita collectionGroup, que costuma falhar nas regras de segurança).
+      final receiptsForItems = usedUnitFallback
+          ? monthReceipts.docs
+          : monthReceipts.docs.where((d) => eligibleReceiptIds.contains(d.id)).toList();
 
       double totalItemsQty = 0.0;
       double totalItemsValue = 0.0;
-      for (final doc in itemsSnap.docs) {
-        final data = doc.data();
-        final receiptId = data['receiptId'] as String? ?? '';
-
-        if (!usedUnitFallback && !eligibleReceiptIds.contains(receiptId)) {
-          continue;
+      for (final receiptDoc in receiptsForItems) {
+        late final QuerySnapshot<Map<String, dynamic>> itemsSnap;
+        try {
+          debugPrint(
+            'DashboardService: QUERY receipt_items (users/$uid/receipts/${receiptDoc.id}/receipt_items)',
+          );
+          itemsSnap = await _firestore
+              .collection('users')
+              .doc(uid)
+              .collection('receipts')
+              .doc(receiptDoc.id)
+              .collection('receipt_items')
+              .get();
+        } catch (e, st) {
+          debugPrint('DashboardService: receipt_items query failed: $e');
+          debugPrintStack(stackTrace: st);
+          rethrow;
         }
 
-        totalItemsQty += (data['quantity'] as num?)?.toDouble() ?? 0.0;
-        totalItemsValue += (data['totalCost'] as num?)?.toDouble() ?? 0.0;
+        for (final doc in itemsSnap.docs) {
+          final data = doc.data();
+          totalItemsQty += (data['quantity'] as num?)?.toDouble() ?? 0.0;
+          totalItemsValue += (data['totalCost'] as num?)?.toDouble() ?? 0.0;
+        }
       }
 
       // Última contagem de estoque (modelo novo).

@@ -171,6 +171,22 @@ class _UnitsPageState extends State<UnitsPage> {
                         child: CircularProgressIndicator(),
                       );
                     }
+                    if (snapshot.hasError) {
+                      final message = snapshot.error.toString().toLowerCase().contains(
+                            'permission-denied',
+                          )
+                          ? 'Sem permissão para listar unidades. Verifique as regras do Firestore para users/{seu uid}/units.'
+                          : 'Não foi possível carregar as unidades.';
+                      return Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Text(
+                            message,
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      );
+                    }
                     final units = snapshot.data ?? [];
                     if (units.isEmpty) {
                       return const Center(

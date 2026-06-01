@@ -1,3 +1,5 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -39,35 +41,66 @@ class _AppShellState extends State<AppShell> {
   bool? _hasSupplier;
   bool? _hasProduct;
 
-  Future<void> _loadPrereqsIfNeeded(String uid) async {
+  Future<bool> _safeHasAnyUnit(String uid) async {
     try {
-      final unitService = context.read<UnitService>();
-      final supplierService = context.read<SupplierService>();
-      final productService = context.read<ProductService>();
-
-      final hasUnit = await unitService.hasAnyUnit(uid);
-      final hasSupplier = await supplierService.hasAnySupplier(uid);
-      final hasProduct = await productService.hasAnyProducts(uid);
-
-      if (!mounted) return;
-      setState(() {
-        _hasUnit = hasUnit;
-        _hasSupplier = hasSupplier;
-        _hasProduct = hasProduct;
-      });
-    } finally {
-      // sem UI extra; apenas garante consistência do estado
+      return await context.read<UnitService>().hasAnyUnit(uid);
+    } on FirebaseException catch (e) {
+      debugPrint('AppShell: hasAnyUnit failed: ${e.code} ${e.message}');
+      return false;
+    } catch (e) {
+      debugPrint('AppShell: hasAnyUnit failed: $e');
+      return false;
     }
+  }
+
+  Future<bool> _safeHasAnySupplier(String uid) async {
+    try {
+      return await context.read<SupplierService>().hasAnySupplier(uid);
+    } on FirebaseException catch (e) {
+      debugPrint('AppShell: hasAnySupplier failed: ${e.code} ${e.message}');
+      return false;
+    } catch (e) {
+      debugPrint('AppShell: hasAnySupplier failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> _safeHasAnyProducts(String uid) async {
+    try {
+      return await context.read<ProductService>().hasAnyProducts(uid);
+    } on FirebaseException catch (e) {
+      debugPrint('AppShell: hasAnyProducts failed: ${e.code} ${e.message}');
+      return false;
+    } catch (e) {
+      debugPrint('AppShell: hasAnyProducts failed: $e');
+      return false;
+    }
+  }
+
+  Future<void> _loadPrereqsIfNeeded(String uid) async {
+    final results = await Future.wait([
+      _safeHasAnyUnit(uid),
+      _safeHasAnySupplier(uid),
+      _safeHasAnyProducts(uid),
+    ]);
+
+    if (!mounted) return;
+    setState(() {
+      _hasUnit = results[0];
+      _hasSupplier = results[1];
+      _hasProduct = results[2];
+    });
   }
 
   Future<void> _attemptSelectPage(AppPage page) async {
     final uid = context.read<AuthController>().user?.uid;
     if (uid == null) return;
 
-    // Início e Perfil não têm bloqueios.
+    // Páginas sem bloqueio por pré-requisito (Unidade deve abrir sempre).
     if (page == AppPage.home ||
         page == AppPage.profile ||
-        page == AppPage.rating) {
+        page == AppPage.rating ||
+        page == AppPage.units) {
       setState(() {
         _currentPage = page;
       });
@@ -127,7 +160,9 @@ class _AppShellState extends State<AppShell> {
     Widget body;
     switch (_currentPage) {
       case AppPage.home:
-        body = const DashboardPage();
+        body = DashboardPage(
+          onOpenUnits: () => _attemptSelectPage(AppPage.units),
+        );
         break;
       case AppPage.profile:
         body = const ProfilePage();

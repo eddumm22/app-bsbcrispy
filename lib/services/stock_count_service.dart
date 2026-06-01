@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 
 import '../models/stock_count_session.dart';
 import '../models/stock_count_session_item.dart';
@@ -64,52 +67,163 @@ class StockCountService {
     return _firestore.collection('users').doc(uid).collection('stock_count_items');
   }
 
+  /// Máximo de produtos por batch (3 writes/produto; limite Firestore = 500).
+  static const int _maxProductsPerBatch = 150;
+
+  Map<String, double> _normalizeQuantities(Map<String, double> raw) {
+    final normalized = <String, double>{};
+    raw.forEach((productId, quantity) {
+      if (productId.trim().isEmpty) return;
+      final qty = quantity.toDouble();
+      if (qty.isNaN || qty.isInfinite || qty < 0) {
+        throw ArgumentError('Quantidade inválida para o produto $productId');
+      }
+      normalized[productId] = qty;
+    });
+    if (normalized.isEmpty) {
+      throw ArgumentError('Nenhuma quantidade válida para salvar');
+    }
+    return normalized;
+  }
+
+  Map<String, dynamic> _countItemFields({
+    required String uid,
+    required String productId,
+    required double quantity,
+    required Timestamp timestamp,
+    String? sessionId,
+  }) {
+    return {
+      'uid': uid,
+      'productId': productId,
+      'quantity': quantity,
+      'date': timestamp,
+      if (sessionId != null) 'sessionId': sessionId,
+    };
+  }
+
   Future<void> saveStockCount({
     required String uid,
     required Map<String, double> quantitiesByProductId,
     required DateTime date,
   }) async {
-    final batch = _firestore.batch();
+    if (uid.trim().isEmpty) {
+      throw ArgumentError('uid do usuário não pode ser vazio');
+    }
+
+    final authUid = FirebaseAuth.instance.currentUser?.uid;
+    if (authUid == null) {
+      throw StateError('Usuário não autenticado no Firebase Auth');
+    }
+    if (authUid != uid) {
+      throw ArgumentError(
+        'uid informado ($uid) difere do usuário autenticado ($authUid)',
+      );
+    }
+
+    final quantities = _normalizeQuantities(quantitiesByProductId);
     final timestamp = Timestamp.fromDate(date);
 
-    // Modelo novo (sessão + itens)
     final sessionRef = _stockCountSessionsCollection(uid).doc();
-    batch.set(sessionRef, {
-      'date': timestamp,
-      'createdAt': FieldValue.serverTimestamp(),
-    });
     final sessionId = sessionRef.id;
+    final sessionPath = 'users/$uid/stock_count_sessions/$sessionId';
 
-    // Modelo antigo (legacy) + novo
-    quantitiesByProductId.forEach((productId, quantity) {
-      // Legado
-      final legacyDocRef = _legacyCountsCollection(uid, productId).doc();
-      batch.set(legacyDocRef, {
-        'quantity': quantity,
+    debugPrint(
+      '[StockCountService] SAVE start uid=$uid sessionId=$sessionId '
+      'products=${quantities.length} date=$date timestamp=$timestamp',
+    );
+
+    debugPrint('[StockCountService] WRITE session → $sessionPath');
+    try {
+      await sessionRef.set({
         'date': timestamp,
+        'createdAt': FieldValue.serverTimestamp(),
       });
+      debugPrint('[StockCountService] OK session $sessionPath');
+    } on FirebaseException catch (e, st) {
+      debugPrint(
+        '[StockCountService] FAIL session ${e.code}: ${e.message}\n$st',
+      );
+      rethrow;
+    }
 
-      // Novo desejado (count_items dentro da session)
-      final nestedItemDocRef = _countItemsCollection(uid, sessionId).doc();
-      batch.set(nestedItemDocRef, {
-        'uid': uid,
-        'productId': productId,
-        'quantity': quantity,
-        'date': timestamp,
-      });
+    final entries = quantities.entries.toList();
+    final batchCount = (entries.length / _maxProductsPerBatch).ceil();
 
-      // Novo antigo (compatibilidade com versões anteriores)
-      final itemDocRef = _stockCountItemsCollection(uid).doc();
-      batch.set(itemDocRef, {
-        'sessionId': sessionId,
-        'productId': productId,
-        'uid': uid,
-        'quantity': quantity,
-        'date': timestamp,
-      });
-    });
+    for (var batchIndex = 0; batchIndex < batchCount; batchIndex++) {
+      final start = batchIndex * _maxProductsPerBatch;
+      final end = math.min(start + _maxProductsPerBatch, entries.length);
+      final chunk = entries.sublist(start, end);
 
-    await batch.commit();
+      debugPrint(
+        '[StockCountService] BATCH ${batchIndex + 1}/$batchCount '
+        '(${chunk.length} produtos)',
+      );
+
+      final batch = _firestore.batch();
+
+      for (final entry in chunk) {
+        final productId = entry.key;
+        final quantity = entry.value;
+
+        final legacyPath =
+            'users/$uid/products/$productId/counts/<auto>';
+        final nestedPath =
+            'users/$uid/stock_count_sessions/$sessionId/count_items/<auto>';
+        final flatPath = 'users/$uid/stock_count_items/<auto>';
+
+        debugPrint(
+          '[StockCountService]   productId=$productId quantity=$quantity '
+          '(legacy, nested, flat)',
+        );
+
+        final legacyDocRef = _legacyCountsCollection(uid, productId).doc();
+        batch.set(legacyDocRef, {
+          'quantity': quantity,
+          'date': timestamp,
+        });
+        debugPrint('[StockCountService]   queued legacy $legacyPath');
+
+        final nestedItemDocRef = _countItemsCollection(uid, sessionId).doc();
+        batch.set(
+          nestedItemDocRef,
+          _countItemFields(
+            uid: uid,
+            productId: productId,
+            quantity: quantity,
+            timestamp: timestamp,
+          ),
+        );
+        debugPrint('[StockCountService]   queued nested $nestedPath');
+
+        final flatItemDocRef = _stockCountItemsCollection(uid).doc();
+        batch.set(
+          flatItemDocRef,
+          _countItemFields(
+            uid: uid,
+            productId: productId,
+            quantity: quantity,
+            timestamp: timestamp,
+            sessionId: sessionId,
+          ),
+        );
+        debugPrint('[StockCountService]   queued flat $flatPath');
+      }
+
+      try {
+        debugPrint('[StockCountService] COMMIT batch ${batchIndex + 1}...');
+        await batch.commit();
+        debugPrint('[StockCountService] OK batch ${batchIndex + 1}');
+      } on FirebaseException catch (e, st) {
+        debugPrint(
+          '[StockCountService] FAIL batch ${batchIndex + 1} '
+          '${e.code}: ${e.message}\n$st',
+        );
+        rethrow;
+      }
+    }
+
+    debugPrint('[StockCountService] SAVE complete sessionId=$sessionId');
   }
 
   // ===== Histórico operacional: sessões (modelo novo) =====

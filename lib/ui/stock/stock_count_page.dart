@@ -1,3 +1,4 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -80,6 +81,10 @@ class _StockCountPageState extends State<StockCountPage> {
       _saving = true;
     });
 
+    debugPrint(
+      '[StockCountPage] save uid=$uid products=${quantities.length} date=$_countDate',
+    );
+
     try {
       await context.read<StockCountService>().saveStockCount(
             uid: uid,
@@ -93,11 +98,30 @@ class _StockCountPageState extends State<StockCountPage> {
       for (final c in _controllers.values) {
         c.clear();
       }
-    } catch (_) {
+    } on FirebaseException catch (e, st) {
+      debugPrint('[StockCountPage] FirebaseException ${e.code}: ${e.message}\n$st');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Não foi possível salvar a contagem. Tente novamente.'),
+        SnackBar(
+          content: Text(
+            'Erro ao salvar (Firestore ${e.code}): ${e.message ?? "sem detalhes"}',
+          ),
+          duration: const Duration(seconds: 6),
+        ),
+      );
+    } on ArgumentError catch (e) {
+      debugPrint('[StockCountPage] ArgumentError: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.message ?? e.toString())),
+      );
+    } catch (e, st) {
+      debugPrint('[StockCountPage] save error: $e\n$st');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Não foi possível salvar a contagem: $e'),
+          duration: const Duration(seconds: 6),
         ),
       );
     } finally {
